@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 const PIN_LENGTH = 4;
 
@@ -25,7 +25,40 @@ interface Props {
   client: Client;
 }
 
+interface BeforeInstallPromptEvent extends Event {
+  prompt: () => Promise<void>;
+  userChoice: Promise<{ outcome: "accepted" | "dismissed" }>;
+}
+
+const EMAIL_RE = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/;
+const PHONE_RE = /(\+?\d[\d\s().-]{7,}\d)/;
+
+function parseClipboard(text: string): { name?: string; email?: string; phone?: string } {
+  const emailMatch = text.match(EMAIL_RE);
+  const email = emailMatch?.[0];
+  const phoneMatch = text.match(PHONE_RE);
+  const phone = phoneMatch?.[0]?.trim();
+
+  let remaining = text;
+  if (email) remaining = remaining.replace(email, " ");
+  if (phone) remaining = remaining.replace(phone, " ");
+
+  const cleaned = remaining
+    .replace(/name[:\-]?/gi, " ")
+    .replace(/email[:\-]?/gi, " ")
+    .replace(/phone[:\-]?/gi, " ")
+    .replace(/customer[:\-]?/gi, " ")
+    .replace(/[\r\n\t,;|]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const name = cleaned.length >= 2 && cleaned.length <= 60 ? cleaned : undefined;
+  return { name, email, phone };
+}
+
 export default function IntakeForm({ client }: Props) {
+  const sessionKey = `intake_pin_${client.slug}`;
+
   const [authenticated, setAuthenticated] = useState(false);
   const [verifiedPin, setVerifiedPin] = useState("");
   const [pinDigits, setPinDigits] = useState<string[]>([]);
@@ -40,9 +73,45 @@ export default function IntakeForm({ client }: Props) {
   const [submitted, setSubmitted] = useState(false);
   const [submittedDelay, setSubmittedDelay] = useState(0);
   const [error, setError] = useState("");
+  const [pasteFlash, setPasteFlash] = useState("");
+
+  const [installEvent, setInstallEvent] = useState<BeforeInstallPromptEvent | null>(null);
+  const [isIOS, setIsIOS] = useState(false);
+  const [isStandalone, setIsStandalone] = useState(false);
+  const [showIOSHelp, setShowIOSHelp] = useState(false);
 
   const blue = client.brand_color || "#1e3a8a";
   const red = "#dc2626";
+
+  // Restore PIN from session on mount
+  useEffect(() => {
+    try {
+      const saved = sessionStorage.getItem(sessionKey);
+      if (saved && saved.length === PIN_LENGTH) {
+        setVerifiedPin(saved);
+        setAuthenticated(true);
+      }
+    } catch {}
+  }, [sessionKey]);
+
+  // PWA install detection
+  useEffect(() => {
+    const ua = window.navigator.userAgent.toLowerCase();
+    const iOS = /iphone|ipad|ipod/.test(ua) && !/crios|fxios/.test(ua);
+    setIsIOS(iOS);
+
+    const standalone =
+      window.matchMedia("(display-mode: standalone)").matches ||
+      (window.navigator as { standalone?: boolean }).standalone === true;
+    setIsStandalone(standalone);
+
+    const handler = (e: Event) => {
+      e.preventDefault();
+      setInstallEvent(e as BeforeInstallPromptEvent);
+    };
+    window.addEventListener("beforeinstallprompt", handler);
+    return () => window.removeEventListener("beforeinstallprompt", handler);
+  }, []);
 
   async function verifyPin(digits: string[]) {
     const pin = digits.join("");
@@ -55,12 +124,15 @@ export default function IntakeForm({ client }: Props) {
       const res = await fetch("/api/intake/verify-pin", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ pin }),
+        body: JSON.stringify({ pin, slug: client.slug }),
       });
 
       if (res.ok) {
         setVerifiedPin(pin);
         setAuthenticated(true);
+        try {
+          sessionStorage.setItem(sessionKey, pin);
+        } catch {}
       } else {
         setPinError("Invalid PIN");
         setShake(true);
@@ -90,7 +162,35 @@ export default function IntakeForm({ client }: Props) {
     setPinDigits((prev) => prev.slice(0, -1));
   }
 
-  const delayLabel = DELAY_OPTIONS.find((o) => o.value === delayMinutes)?.label || `${delayMinutes} min`;
+  async function handlePaste() {
+    try {
+      const text = await navigator.clipboard.readText();
+      if (!text) {
+        setPasteFlash("Clipboard empty");
+        setTimeout(() => setPasteFlash(""), 1500);
+        return;
+      }
+      const parsed = parseClipboard(text);
+      if (parsed.email) setCustomerEmail(parsed.email);
+      if (parsed.name) setCustomerName(parsed.name);
+      const filled = [parsed.name && "name", parsed.email && "email"].filter(Boolean).join(" + ");
+      setPasteFlash(filled ? `Filled ${filled}` : "Couldn't parse clipboard");
+      setTimeout(() => setPasteFlash(""), 1800);
+    } catch {
+      setPasteFlash("Paste blocked — allow clipboard access");
+      setTimeout(() => setPasteFlash(""), 2000);
+    }
+  }
+
+  async function handleInstall() {
+    if (installEvent) {
+      await installEvent.prompt();
+      await installEvent.userChoice;
+      setInstallEvent(null);
+    } else if (isIOS) {
+      setShowIOSHelp(true);
+    }
+  }
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -135,6 +235,8 @@ export default function IntakeForm({ client }: Props) {
     setError("");
   }
 
+  const showInstallButton = !isStandalone && (installEvent !== null || isIOS);
+
   // ── PIN Lock Screen ──
   if (!authenticated) {
     const numPadKeys = [
@@ -148,7 +250,6 @@ export default function IntakeForm({ client }: Props) {
       <div className="min-h-screen bg-black flex flex-col items-center justify-between py-12 px-4 select-none overflow-hidden">
         <div className="flex-1" />
 
-        {/* Top section */}
         <div className="flex flex-col items-center mb-8">
           {client.logo_url && (
             <img
@@ -165,7 +266,6 @@ export default function IntakeForm({ client }: Props) {
           </p>
         </div>
 
-        {/* PIN Dots */}
         <div
           className={`flex gap-5 mb-10 ${shake ? "animate-[shake_0.4s_ease-in-out]" : ""}`}
         >
@@ -192,7 +292,6 @@ export default function IntakeForm({ client }: Props) {
           </p>
         )}
 
-        {/* Number Pad */}
         <div className="grid grid-cols-3 gap-x-6 gap-y-3 mb-4">
           {numPadKeys.flat().map((key, i) => {
             if (key === "") {
@@ -298,7 +397,6 @@ export default function IntakeForm({ client }: Props) {
   return (
     <div className="min-h-screen bg-white flex items-center justify-center p-4">
       <div className="w-full max-w-sm">
-        {/* Header */}
         <div className="text-center mb-8">
           {client.logo_url && (
             <img
@@ -315,8 +413,45 @@ export default function IntakeForm({ client }: Props) {
           </p>
         </div>
 
+        {showInstallButton && (
+          <button
+            type="button"
+            onClick={handleInstall}
+            className="w-full mb-4 flex items-center justify-center gap-2 border-2 rounded-xl py-2.5 text-sm font-medium transition-colors"
+            style={{ borderColor: blue, color: blue }}
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M12 3v12" />
+              <path d="m7 10 5 5 5-5" />
+              <path d="M20 21H4" />
+            </svg>
+            Install on Home Screen
+          </button>
+        )}
+
         <form onSubmit={handleSubmit} className="space-y-4">
-          {/* Name */}
+          <div className="flex items-center justify-between">
+            <span className="text-xs font-medium text-gray-400 uppercase tracking-wider">Customer Info</span>
+            <button
+              type="button"
+              onClick={handlePaste}
+              className="text-xs font-medium flex items-center gap-1 px-2 py-1 rounded-md transition-colors"
+              style={{ color: blue, backgroundColor: `${blue}10` }}
+            >
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <rect x="8" y="2" width="8" height="4" rx="1" />
+                <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" />
+              </svg>
+              Paste
+            </button>
+          </div>
+
+          {pasteFlash && (
+            <p className="text-xs text-center -mt-2" style={{ color: blue }}>
+              {pasteFlash}
+            </p>
+          )}
+
           <div>
             <label className="block text-sm font-medium mb-1.5" style={{ color: blue }}>
               Customer Name
@@ -333,7 +468,6 @@ export default function IntakeForm({ client }: Props) {
             />
           </div>
 
-          {/* Email */}
           <div>
             <label className="block text-sm font-medium mb-1.5" style={{ color: blue }}>
               Customer Email <span style={{ color: red }}>*</span>
@@ -350,7 +484,6 @@ export default function IntakeForm({ client }: Props) {
             />
           </div>
 
-          {/* Phone (disabled for now) */}
           <div>
             <label className="block text-sm font-medium mb-1.5 text-gray-300">
               Phone Number <span className="text-xs">(coming soon)</span>
@@ -363,7 +496,6 @@ export default function IntakeForm({ client }: Props) {
             />
           </div>
 
-          {/* Service (disabled for now) */}
           <div>
             <label className="block text-sm font-medium mb-1.5 text-gray-300">
               Service <span className="text-xs">(coming soon)</span>
@@ -376,7 +508,6 @@ export default function IntakeForm({ client }: Props) {
             />
           </div>
 
-          {/* Send Delay */}
           <div>
             <label className="block text-sm font-medium mb-2" style={{ color: blue }}>
               Send review request
@@ -415,6 +546,51 @@ export default function IntakeForm({ client }: Props) {
             {submitting ? "Submitting..." : "Send Review Request"}
           </button>
         </form>
+
+        {showIOSHelp && (
+          <div
+            className="fixed inset-0 bg-black/60 flex items-end sm:items-center justify-center z-50 p-4"
+            onClick={() => setShowIOSHelp(false)}
+          >
+            <div
+              className="bg-white rounded-2xl p-6 w-full max-w-sm"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <h3 className="text-lg font-bold mb-3" style={{ color: blue }}>
+                Install on iPhone
+              </h3>
+              <ol className="space-y-3 text-sm text-gray-700 mb-5">
+                <li className="flex gap-3">
+                  <span className="font-bold" style={{ color: blue }}>1.</span>
+                  <span>
+                    Tap the <strong>Share</strong> icon
+                    <svg className="inline-block ml-1 -mt-0.5" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8" />
+                      <polyline points="16 6 12 2 8 6" />
+                      <line x1="12" y1="2" x2="12" y2="15" />
+                    </svg>
+                    at the bottom of Safari
+                  </span>
+                </li>
+                <li className="flex gap-3">
+                  <span className="font-bold" style={{ color: blue }}>2.</span>
+                  <span>Scroll down and tap <strong>Add to Home Screen</strong></span>
+                </li>
+                <li className="flex gap-3">
+                  <span className="font-bold" style={{ color: blue }}>3.</span>
+                  <span>Tap <strong>Add</strong> in the top right</span>
+                </li>
+              </ol>
+              <button
+                onClick={() => setShowIOSHelp(false)}
+                className="w-full text-white font-semibold py-3 rounded-xl"
+                style={{ backgroundColor: blue }}
+              >
+                Got it
+              </button>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
